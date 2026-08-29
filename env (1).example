@@ -1,0 +1,15 @@
+DISCORD_TOKEN=
+GUILD_ID=
+
+# Rolle, die alle Tickets sehen darf (z.B. "Support")
+SUPPORT_ROLE_NAME=Support
+
+# NEU: Admin- und Moderator-Rolle, werden von /setup automatisch angelegt
+ADMIN_ROLE_NAME=Admin
+MOD_ROLE_NAME=Moderator
+
+# NEU: Namen der Kategorien/Rollen eures SEPARATEN Ticket-Bots.
+# /setup fasst diese NIE an (kein Löschen, kein Bearbeiten).
+# Mehrere Werte mit Komma trennen, z.B. "Tickets,Support-Tickets"
+PROTECTED_CATEGORY_NAMES=
+PROTECTED_ROLE_NAMES=

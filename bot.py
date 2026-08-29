@@ -55,6 +55,13 @@ MOD_LOG_CHANNEL = "mod-logs"
 MESSAGE_LOG_CHANNEL = "message-logs"
 REVIEWS_CHANNEL = "⭐・bewertungen"
 
+# Kategorien/Rollen, die /setup NIE anfasst (weder löschen noch bearbeiten).
+# Trag hier die Namen der Kategorien und Rollen eures separaten Ticket-Bots ein,
+# damit /setup dessen Kanäle und Rollen nicht mit wegräumt. Mehrere Werte mit
+# Komma trennen, z.B. PROTECTED_CATEGORY_NAMES="Tickets,Support-Tickets"
+_extra_protected_categories = {c.strip() for c in os.getenv("PROTECTED_CATEGORY_NAMES", "").split(",") if c.strip()}
+_extra_protected_roles = {r.strip() for r in os.getenv("PROTECTED_ROLE_NAMES", "").split(",") if r.strip()}
+
 # VOLT-Markenfarben (aus dem Logo: schwarzer Kreis, roter Blitz/Ring, weißer Blitz)
 COLOR_RED = discord.Colour.from_str("#E30613")
 COLOR_DARK = discord.Colour.from_str("#1A1A1D")   # fast schwarz (reines #000000 gilt bei Discord als "keine Farbe")
@@ -481,19 +488,43 @@ async def setup_cmd(interaction: discord.Interaction):
 
     guild = interaction.guild
 
-    # 1) Kanäle löschen
+    # 0) Geschützte Kategorien sammeln: dieser Bot's eigene Ticket-Kategorien
+    #    (laufende Bestellungen) + alles, was in PROTECTED_CATEGORY_NAMES steht
+    #    (z.B. euer separater Ticket-Bot). Diese werden NICHT angefasst.
+    protected_category_names = {"🎫 TICKETS", *STATUS_CATEGORIES.values(), *_extra_protected_categories}
+    protected_role_names = {ADMIN_ROLE_NAME, MOD_ROLE_NAME, SUPPORT_ROLE_NAME, "Kunde", *_extra_protected_roles}
+    # ^ die eigenen Rollennamen stehen hier nicht, weil wir die bewusst neu
+    #   erstellen wollen - siehe Schritt 2. Nur die EXTRA-Rollen (anderer Bot)
+    #   werden komplett übersprungen.
+
+    protected_channels = [
+        ch for ch in guild.channels
+        if (ch.category and ch.category.name in protected_category_names)
+        or (isinstance(ch, discord.CategoryChannel) and ch.name in protected_category_names)
+    ]
+    protected_channel_ids = {ch.id for ch in protected_channels}
+    skipped_channels = len(protected_channels)
+
+    # 1) Kanäle löschen (außer geschützte)
     for channel in list(guild.channels):
+        if channel.id in protected_channel_ids:
+            continue
         try:
             await channel.delete(reason="VOLT /setup Rebuild")
         except discord.HTTPException as e:
             log.warning("Kanal %s konnte nicht gelöscht werden: %s", channel, e)
 
-    # 2) Rollen löschen (außer @everyone und von Discord verwalteten Rollen, z.B. Bot-Rollen, Booster-Rolle)
+    # 2) Rollen löschen (außer @everyone, von Discord verwalteten Rollen und
+    #    den explizit geschützten Rollen des anderen Bots)
+    skipped_roles = 0
     for role in list(guild.roles):
         if role.is_default() or role.managed:
             continue
         if role >= guild.me.top_role:
             continue  # kann der Bot ohnehin nicht löschen
+        if role.name in _extra_protected_roles:
+            skipped_roles += 1
+            continue
         try:
             await role.delete(reason="VOLT /setup Rebuild")
         except discord.HTTPException as e:
@@ -516,6 +547,25 @@ async def setup_cmd(interaction: discord.Interaction):
     mod_role = created_roles[MOD_ROLE_NAME]
     support_role = created_roles[SUPPORT_ROLE_NAME]
     staff_roles = [admin_role, mod_role, support_role]
+
+    # 3.5) Zugriff auf geschützte Ticket-Kanäle DIESES Bots (🎫 TICKETS,
+    #      🟠/🟡/🟢-Status) für die neuen Staff-Rollen wiederherstellen.
+    #      Der andere Ticket-Bot (PROTECTED_CATEGORY_NAMES) wird hier NICHT
+    #      angefasst, damit dessen eigene Rollen/Overwrites unangetastet bleiben.
+    own_ticket_category_names = {"🎫 TICKETS", *STATUS_CATEGORIES.values()}
+    for ch in protected_channels:
+        if isinstance(ch, discord.CategoryChannel):
+            continue
+        cat_name = ch.category.name if ch.category else None
+        if cat_name not in own_ticket_category_names:
+            continue
+        try:
+            overwrites = dict(ch.overwrites)
+            for r in staff_roles:
+                overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            await ch.edit(overwrites=overwrites, reason="VOLT /setup: Staff-Zugriff nach Rollen-Rebuild erneuern")
+        except discord.HTTPException as e:
+            log.warning("Konnte Overwrites für %s nicht erneuern: %s", ch, e)
 
     # 4) Kategorien & Kanäle neu anlegen
     bestellen_channel = None
@@ -540,9 +590,14 @@ async def setup_cmd(interaction: discord.Interaction):
         )
         await bestellen_channel.send(embed=embed, view=ProductMenuView())
 
+    skip_note = ""
+    if skipped_channels or skipped_roles:
+        skip_note = f"\nℹ️ Übersprungen (nicht angefasst): {skipped_channels} Kanäle/Kategorien, {skipped_roles} Rollen (Ticket-System / geschützte Rollen)."
+
     await interaction.followup.send(
         f"✅ Server wurde neu aufgebaut: {len(ROLE_CONFIG)} Rollen, "
-        f"{sum(len(c) for _, c in CHANNEL_STRUCTURE)} Kanäle in {len(CHANNEL_STRUCTURE)} Kategorien.",
+        f"{sum(len(c) for _, c in CHANNEL_STRUCTURE)} Kanäle in {len(CHANNEL_STRUCTURE)} Kategorien."
+        f"{skip_note}",
         ephemeral=True,
     )
 

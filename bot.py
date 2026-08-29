@@ -1,20 +1,33 @@
 """
-TICKET-BOT
-==========
-Zuständig für das Bestell-System. Postet Buttons in #bestellen -> Klick
-öffnet ein privates Ticket, in dem Big/Klein Fam ausgewählt wird und der
-passende Preis angezeigt wird. Danach kann das Ticket geschlossen werden
-(Transcript wird in #ticket-logs gespeichert).
+TICKET-BOT (VOLT)
+==================
+Basis-Funktion (unverändert): Bestell-Buttons in #bestellen -> Ticket ->
+Fam-Größe wählen -> Preis anzeigen -> Ticket schließen mit Transcript-Log.
+
+NEU in dieser Version:
+  /setup           [Admin] Löscht ALLE Kanäle & Rollen (außer @everyone,
+                    verwalteten/Bot-Rollen) und baut Kategorien, Kanäle und
+                    Rollen passend zum VOLT-Logo (Rot/Schwarz/Weiß) neu auf.
+                    Fragt vorher zur Sicherheit noch mal nach ("bist du sicher?").
+  /ban             [Mod] Bannt ein Mitglied, schickt optional eine DM,
+                    protokolliert in #mod-logs.
+  Message-Logging  Jede bearbeitete oder gelöschte Nachricht wird mit
+                    Vorher/Nachher-Inhalt, Autor, Kanal und Zeitstempel in
+                    #message-logs gepostet.
 
 Einrichtung:
-1. pip install -r requirements.txt
-2. .env.example -> .env kopieren und ausfüllen
-3. python bot.py
-4. Im Kanal #bestellen einmalig /setup-tickets ausführen
+  1. pip install -r requirements.txt
+  2. .env.example -> .env kopieren und ausfüllen
+  3. python bot.py
+  4. Auf dem Server einmalig /setup ausführen (baut alles auf)
+  5. In #bestellen wird das Bestell-Menü automatisch gepostet
 """
 
 import os
+import io
 import logging
+import difflib
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -26,40 +39,162 @@ from products import PRODUCTS, HOSTING, TERMS
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("ticket-bot")
+log = logging.getLogger("volt-bot")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)
+
+# Rollennamen zentral halten, damit sie überall konsistent verwendet werden
+ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "Admin")
+MOD_ROLE_NAME = os.getenv("MOD_ROLE_NAME", "Moderator")
 SUPPORT_ROLE_NAME = os.getenv("SUPPORT_ROLE_NAME", "Support")
+
+# Log-Kanäle
+TICKET_LOG_CHANNEL = "ticket-logs"
+MOD_LOG_CHANNEL = "mod-logs"
+MESSAGE_LOG_CHANNEL = "message-logs"
+REVIEWS_CHANNEL = "⭐・bewertungen"
+
+# VOLT-Markenfarben (aus dem Logo: schwarzer Kreis, roter Blitz/Ring, weißer Blitz)
+COLOR_RED = discord.Colour.from_str("#E30613")
+COLOR_DARK = discord.Colour.from_str("#1A1A1D")   # fast schwarz (reines #000000 gilt bei Discord als "keine Farbe")
+COLOR_WHITE = discord.Colour.from_str("#F2F2F2")
+COLOR_RED_DARK = discord.Colour.from_str("#8C0B1E")
 
 intents = discord.Intents.default()
 intents.members = True
+intents.message_content = True  # nötig, damit gelöschte/editierte Nachrichten Inhalt haben
 
-bot = commands.Bot(command_prefix="!ticket-", intents=intents)
+
+# ---------------------------------------------------------------------------
+# Server-Struktur: hier zentral definiert, damit /setup reproduzierbar ist
+# ---------------------------------------------------------------------------
+
+# Reihenfolge = Rollen-Hierarchie, oben = höchste Rolle (außer @everyone/Bot)
+ROLE_CONFIG = [
+    {
+        "name": ADMIN_ROLE_NAME,
+        "colour": COLOR_RED,
+        "gradient_to": COLOR_DARK,   # wird nur genutzt, falls Server-Boosts es zulassen
+        "hoist": True,
+        "mentionable": True,
+        "permissions": discord.Permissions(administrator=True),
+    },
+    {
+        "name": MOD_ROLE_NAME,
+        "colour": COLOR_RED_DARK,
+        "gradient_to": None,
+        "hoist": True,
+        "mentionable": True,
+        "permissions": discord.Permissions(
+            kick_members=True, ban_members=True, manage_messages=True,
+            manage_channels=True, moderate_members=True, view_audit_log=True,
+        ),
+    },
+    {
+        "name": SUPPORT_ROLE_NAME,
+        "colour": COLOR_WHITE,
+        "gradient_to": None,
+        "hoist": True,
+        "mentionable": True,
+        "permissions": discord.Permissions(manage_messages=True, manage_channels=False),
+    },
+    {
+        "name": "Kunde",
+        "colour": COLOR_DARK,
+        "gradient_to": None,
+        "hoist": False,
+        "mentionable": False,
+        "permissions": discord.Permissions(),
+    },
+]
+
+# (Kategorie, [(Kanalname, ist_privat_für_staff), ...])
+CHANNEL_STRUCTURE = [
+    ("📢 INFO", [
+        ("willkommen", False),
+        ("regeln", False),
+        ("ankuendigungen", False),
+    ]),
+    ("🛒 BESTELLUNG", [
+        ("bestellen", False),
+        (REVIEWS_CHANNEL, False),
+    ]),
+    ("💬 COMMUNITY", [
+        ("allgemein", False),
+    ]),
+    ("🛡️ STAFF", [
+        (MOD_LOG_CHANNEL, True),
+        (MESSAGE_LOG_CHANNEL, True),
+        (TICKET_LOG_CHANNEL, True),
+    ]),
+]
+
+
+async def apply_role_colour(role: discord.Role, colour: discord.Colour, gradient_to: discord.Colour | None):
+    """Setzt eine solide Farbe; versucht zusätzlich einen Farbverlauf, falls
+    discord.py das unterstützt UND der Server genug Boosts (Enhanced Role
+    Styles, ab 3 Boosts) dafür freigeschaltet hat. Schlägt das fehl, bleibt
+    einfach die solide Farbe bestehen - kein Fehler für den Nutzer sichtbar."""
+    try:
+        await role.edit(colour=colour, reason="VOLT /setup")
+    except discord.HTTPException as e:
+        log.warning("Konnte Farbe für Rolle %s nicht setzen: %s", role.name, e)
+        return
+
+    if gradient_to is None:
+        return
+
+    RoleColours = getattr(discord, "RoleColours", None)
+    if RoleColours is None:
+        return  # installierte discord.py-Version unterstützt das (noch) nicht
+
+    try:
+        colours = RoleColours(primary_colour=colour, secondary_colour=gradient_to)
+        await role.edit(colours=colours, reason="VOLT /setup (Gradient)")
+    except discord.HTTPException:
+        # Server hat vermutlich nicht genug Boosts für Enhanced Role Styles -> ignorieren
+        pass
+
+
+class ConfirmView(discord.ui.View):
+    """Generische Ja/Nein-Bestätigung für gefährliche Aktionen."""
+
+    def __init__(self, author_id: int):
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.value: bool | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Nur der Befehl-Ausführende kann bestätigen.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Ja, alles löschen & neu aufbauen", style=discord.ButtonStyle.danger, emoji="⚠️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = True
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(content="⏳ Server wird zurückgesetzt und neu aufgebaut...", view=self)
+        self.stop()
+
+    @discord.ui.button(label="Abbrechen", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = False
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(content="❌ Abgebrochen, es wurde nichts geändert.", view=self)
+        self.stop()
 
 
 def is_admin():
     return app_commands.checks.has_permissions(administrator=True)
 
 
-async def get_or_create_category(guild: discord.Guild, name: str) -> discord.CategoryChannel:
-    cat = discord.utils.get(guild.categories, name=name)
-    return cat or await guild.create_category(name)
-
-
-async def get_or_create_channel(guild: discord.Guild, name: str, category=None, overwrites=None) -> discord.TextChannel:
-    ch = discord.utils.get(guild.text_channels, name=name)
-    if ch is None:
-        ch = await guild.create_text_channel(name, category=category, overwrites=overwrites or {})
-    return ch
-
-
 def product_embed(key: str) -> discord.Embed:
     p = PRODUCTS[key]
-    embed = discord.Embed(
-        title=f"{p['emoji']} {p['name']}",
-        color=discord.Color.gold(),
-    )
+    embed = discord.Embed(title=f"{p['emoji']} {p['name']}", color=COLOR_RED)
     embed.add_field(name="Big Fam", value=f"{p['big']}€", inline=True)
     embed.add_field(name="Klein Fam", value=f"{p['klein']}€", inline=True)
     if key == "komplett":
@@ -113,11 +248,7 @@ STATUS_CATEGORIES = {
     "pause": "🟡 Pause ──",
     "fertig": "🟢 Fertig ──",
 }
-STATUS_PREFIX = {
-    "in_bearbeitung": "🟠",
-    "pause": "🟡",
-    "fertig": "🟢",
-}
+STATUS_PREFIX = {"in_bearbeitung": "🟠", "pause": "🟡", "fertig": "🟢"}
 
 
 async def set_ticket_status(channel: discord.TextChannel, status: str):
@@ -126,7 +257,6 @@ async def set_ticket_status(channel: discord.TextChannel, status: str):
     category = discord.utils.get(guild.categories, name=category_name) or await guild.create_category(category_name)
     await channel.edit(category=category, sync_permissions=True)
 
-    # bisheriges Status-Emoji am Anfang des Namens entfernen, neues voranstellen
     base_name = channel.name
     for emoji in STATUS_PREFIX.values():
         if base_name.startswith(emoji + "-") or base_name.startswith(emoji):
@@ -156,13 +286,10 @@ class StatusView(discord.ui.View):
 
 
 class RatingView(discord.ui.View):
-    """Sterne-Bewertung, die der Kunde vor dem Schließen abgeben kann."""
-
     def __init__(self, requester_id: int):
         super().__init__(timeout=120)
         self.requester_id = requester_id
         self.rating: int | None = None
-        self.message: discord.Message | None = None
 
     async def _handle(self, interaction: discord.Interaction, stars: int):
         if interaction.user.id != self.requester_id:
@@ -215,7 +342,6 @@ class CloseTicketView(discord.ui.View):
 
         await interaction.response.send_message("🔒 Ticket wird in 60 Sekunden archiviert. Bitte kurz bewerten:", ephemeral=False)
 
-        # Bewertung abfragen, bevor das Ticket wirklich geschlossen wird
         rating = None
         requester_id = None
         if channel.topic and "|" in channel.topic:
@@ -226,33 +352,29 @@ class CloseTicketView(discord.ui.View):
 
         if requester_id:
             rating_view = RatingView(requester_id)
-            rating_msg = await channel.send(
-                f"<@{requester_id}> Wie zufrieden warst du mit diesem Ticket?", view=rating_view
-            )
+            await channel.send(f"<@{requester_id}> Wie zufrieden warst du mit diesem Ticket?", view=rating_view)
             await rating_view.wait()
             rating = rating_view.rating
 
             if rating:
-                reviews_channel = discord.utils.get(guild.text_channels, name="⭐・bewertungen") or discord.utils.get(guild.text_channels, name="bewertungen")
+                reviews_channel = discord.utils.get(guild.text_channels, name=REVIEWS_CHANNEL) or discord.utils.get(guild.text_channels, name="bewertungen")
                 if reviews_channel:
                     review_embed = discord.Embed(
                         title="Neue Kundenbewertung",
                         description=f"{'⭐' * rating}{'☆' * (5 - rating)}  ({rating}/5)",
-                        color=discord.Color.from_str("#E30613"),
+                        color=COLOR_RED,
                     )
                     review_embed.add_field(name="Ticket", value=channel.name, inline=True)
                     review_embed.add_field(name="Kunde", value=f"<@{requester_id}>", inline=True)
                     await reviews_channel.send(embed=review_embed)
 
-        # Transcript zusammenbauen
         lines = []
         async for msg in channel.history(limit=None, oldest_first=True):
             lines.append(f"[{msg.created_at:%Y-%m-%d %H:%M}] {msg.author}: {msg.content}")
         transcript = "\n".join(lines) or "(keine Nachrichten)"
 
-        log_channel = discord.utils.get(guild.text_channels, name="ticket-logs")
+        log_channel = discord.utils.get(guild.text_channels, name=TICKET_LOG_CHANNEL)
         if log_channel:
-            import io
             file = discord.File(io.BytesIO(transcript.encode("utf-8")), filename=f"{channel.name}.txt")
             await log_channel.send(content=f"📁 Transcript von {channel.name} (geschlossen von {member})", file=file)
 
@@ -273,7 +395,7 @@ class ProductButton(discord.ui.Button):
         guild = interaction.guild
         user = interaction.user
 
-        tickets_category = await get_or_create_category(guild, "🎫 TICKETS")
+        tickets_category = discord.utils.get(guild.categories, name="🎫 TICKETS") or await guild.create_category("🎫 TICKETS")
         support_role = discord.utils.get(guild.roles, name=SUPPORT_ROLE_NAME)
 
         overwrites = {
@@ -311,7 +433,14 @@ class ProductMenuView(discord.ui.View):
             self.add_item(ProductButton(key, product))
 
 
-class TicketBot(commands.Bot):
+# ---------------------------------------------------------------------------
+# Bot
+# ---------------------------------------------------------------------------
+
+class VoltBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!volt-", intents=intents)
+
     async def setup_hook(self):
         self.add_view(ProductMenuView())
         self.add_view(CloseTicketView())
@@ -324,34 +453,122 @@ class TicketBot(commands.Bot):
             await self.tree.sync()
 
 
-bot = TicketBot(command_prefix="!ticket-", intents=intents)
+bot = VoltBot()
 
 
 @bot.event
 async def on_ready():
-    log.info("Ticket-Bot eingeloggt als %s", bot.user)
+    log.info("VOLT-Bot eingeloggt als %s", bot.user)
 
 
-@bot.tree.command(name="setup-tickets", description="[Admin] Postet das Bestell-Menü in diesen Kanal")
+# ---------------------------------------------------------------------------
+# /setup – alles löschen & neu aufbauen
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="setup", description="[Admin] Löscht ALLE Kanäle & Rollen und baut den Server neu auf")
 @is_admin()
-async def setup_tickets(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="🛒 Bestellung",
-        description="Wähle unten das gewünschte Produkt aus, um ein Ticket zu eröffnen.",
-        color=discord.Color.blurple(),
+async def setup_cmd(interaction: discord.Interaction):
+    view = ConfirmView(interaction.user.id)
+    await interaction.response.send_message(
+        "⚠️ **Das löscht wirklich ALLE Kanäle und Rollen** (außer von Discord/Bots verwalteten) "
+        "und baut sie neu auf. Das kann nicht rückgängig gemacht werden.\n\nBist du sicher?",
+        view=view,
+        ephemeral=True,
     )
-    await interaction.channel.send(embed=embed, view=ProductMenuView())
-    await interaction.response.send_message("✅ Bestell-Menü wurde gepostet.", ephemeral=True)
+    await view.wait()
+    if not view.value:
+        return
 
+    guild = interaction.guild
+
+    # 1) Kanäle löschen
+    for channel in list(guild.channels):
+        try:
+            await channel.delete(reason="VOLT /setup Rebuild")
+        except discord.HTTPException as e:
+            log.warning("Kanal %s konnte nicht gelöscht werden: %s", channel, e)
+
+    # 2) Rollen löschen (außer @everyone und von Discord verwalteten Rollen, z.B. Bot-Rollen, Booster-Rolle)
+    for role in list(guild.roles):
+        if role.is_default() or role.managed:
+            continue
+        if role >= guild.me.top_role:
+            continue  # kann der Bot ohnehin nicht löschen
+        try:
+            await role.delete(reason="VOLT /setup Rebuild")
+        except discord.HTTPException as e:
+            log.warning("Rolle %s konnte nicht gelöscht werden: %s", role, e)
+
+    # 3) Rollen neu anlegen (Reihenfolge = ROLE_CONFIG, oben = höchste Rolle)
+    created_roles: dict[str, discord.Role] = {}
+    for cfg in ROLE_CONFIG:
+        role = await guild.create_role(
+            name=cfg["name"],
+            hoist=cfg["hoist"],
+            mentionable=cfg["mentionable"],
+            permissions=cfg["permissions"],
+            reason="VOLT /setup Rebuild",
+        )
+        await apply_role_colour(role, cfg["colour"], cfg["gradient_to"])
+        created_roles[cfg["name"]] = role
+
+    admin_role = created_roles[ADMIN_ROLE_NAME]
+    mod_role = created_roles[MOD_ROLE_NAME]
+    support_role = created_roles[SUPPORT_ROLE_NAME]
+    staff_roles = [admin_role, mod_role, support_role]
+
+    # 4) Kategorien & Kanäle neu anlegen
+    bestellen_channel = None
+    for cat_name, channels in CHANNEL_STRUCTURE:
+        category = await guild.create_category(cat_name, reason="VOLT /setup Rebuild")
+        for chan_name, staff_only in channels:
+            overwrites = {}
+            if staff_only:
+                overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+                for r in staff_roles:
+                    overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+            new_channel = await guild.create_text_channel(chan_name, category=category, overwrites=overwrites)
+            if chan_name == "bestellen":
+                bestellen_channel = new_channel
+
+    # 5) Bestell-Menü automatisch in #bestellen posten
+    if bestellen_channel:
+        embed = discord.Embed(
+            title="🛒 Bestellung",
+            description="Wähle unten das gewünschte Produkt aus, um ein Ticket zu eröffnen.",
+            color=COLOR_RED,
+        )
+        await bestellen_channel.send(embed=embed, view=ProductMenuView())
+
+    await interaction.followup.send(
+        f"✅ Server wurde neu aufgebaut: {len(ROLE_CONFIG)} Rollen, "
+        f"{sum(len(c) for _, c in CHANNEL_STRUCTURE)} Kanäle in {len(CHANNEL_STRUCTURE)} Kategorien.",
+        ephemeral=True,
+    )
+
+
+@setup_cmd.error
+async def on_setup_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Dieser Command ist nur für Administratoren.", ephemeral=True)
+    else:
+        log.exception("Fehler in /setup", exc_info=error)
+        target = interaction.followup if interaction.response.is_done() else interaction.response
+        await target.send_message("❌ Es ist ein Fehler aufgetreten.", ephemeral=True) if not interaction.response.is_done() \
+            else await interaction.followup.send("❌ Es ist ein Fehler aufgetreten.", ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /post-preisliste (unverändert, zusätzlicher Admin-Command)
+# ---------------------------------------------------------------------------
 
 @bot.tree.command(name="post-preisliste", description="[Admin] Postet die vollständige Preisliste in diesen Kanal")
 @is_admin()
 async def post_preisliste(interaction: discord.Interaction):
-    accent = discord.Color.from_str("#E30613")
     intro = discord.Embed(
         title="💰 VOLT – Preisliste",
         description="Übersicht aller Leistungen. Preise gelten pro Fam-Größe, siehe Angaben.",
-        color=accent,
+        color=COLOR_RED,
     )
     await interaction.channel.send(embed=intro)
     for key in PRODUCTS:
@@ -359,16 +576,145 @@ async def post_preisliste(interaction: discord.Interaction):
     await interaction.response.send_message("✅ Preisliste gepostet.", ephemeral=True)
 
 
-@setup_tickets.error
-async def on_ticket_command_error(interaction: discord.Interaction, error):
+# ---------------------------------------------------------------------------
+# /ban
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="ban", description="[Mod] Bannt ein Mitglied vom Server")
+@app_commands.describe(
+    mitglied="Das zu bannende Mitglied",
+    grund="Grund für den Bann (wird dem Mitglied und im Log angezeigt)",
+    nachrichten_loeschen_tage="Nachrichten der letzten X Tage mit löschen (0-7, Standard 0)",
+)
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban_cmd(
+    interaction: discord.Interaction,
+    mitglied: discord.Member,
+    grund: str = "Kein Grund angegeben",
+    nachrichten_loeschen_tage: app_commands.Range[int, 0, 7] = 0,
+):
+    guild = interaction.guild
+    moderator = interaction.user
+
+    if mitglied.id == moderator.id:
+        await interaction.response.send_message("❌ Du kannst dich nicht selbst bannen.", ephemeral=True)
+        return
+    if mitglied.top_role >= moderator.top_role and moderator.id != guild.owner_id:
+        await interaction.response.send_message("❌ Du kannst niemanden mit gleicher oder höherer Rolle bannen.", ephemeral=True)
+        return
+    if mitglied.top_role >= guild.me.top_role:
+        await interaction.response.send_message("❌ Meine Rolle ist zu niedrig, um dieses Mitglied zu bannen.", ephemeral=True)
+        return
+
+    dm_sent = True
+    try:
+        dm_embed = discord.Embed(
+            title=f"Du wurdest von {guild.name} gebannt",
+            description=f"**Grund:** {grund}",
+            color=COLOR_RED,
+        )
+        await mitglied.send(embed=dm_embed)
+    except discord.HTTPException:
+        dm_sent = False
+
+    await guild.ban(mitglied, reason=f"{moderator}: {grund}", delete_message_days=nachrichten_loeschen_tage)
+
+    result_embed = discord.Embed(
+        title="🔨 Mitglied gebannt",
+        color=COLOR_RED,
+        timestamp=datetime.now(timezone.utc),
+    )
+    result_embed.add_field(name="Mitglied", value=f"{mitglied} (`{mitglied.id}`)", inline=False)
+    result_embed.add_field(name="Moderator", value=str(moderator), inline=True)
+    result_embed.add_field(name="Grund", value=grund, inline=True)
+    result_embed.add_field(name="DM zugestellt", value="Ja" if dm_sent else "Nein (DMs deaktiviert)", inline=True)
+
+    await interaction.response.send_message(embed=result_embed)
+
+    mod_log = discord.utils.get(guild.text_channels, name=MOD_LOG_CHANNEL)
+    if mod_log:
+        await mod_log.send(embed=result_embed)
+
+
+@ban_cmd.error
+async def on_ban_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Dieser Command ist nur für Administratoren.", ephemeral=True)
+        await interaction.response.send_message("❌ Dieser Command ist nur für Moderatoren/Admins.", ephemeral=True)
     else:
-        log.exception("Fehler in Ticket-Command", exc_info=error)
+        log.exception("Fehler in /ban", exc_info=error)
         if interaction.response.is_done():
             await interaction.followup.send("❌ Es ist ein Fehler aufgetreten.", ephemeral=True)
         else:
             await interaction.response.send_message("❌ Es ist ein Fehler aufgetreten.", ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# Message-Logging: jede Bearbeitung/Löschung wird protokolliert
+# ---------------------------------------------------------------------------
+
+def _truncate(text: str, limit: int = 1000) -> str:
+    text = text or "*(kein Text / nur Anhang oder Embed)*"
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+async def _get_message_log_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    return discord.utils.get(guild.text_channels, name=MESSAGE_LOG_CHANNEL)
+
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if message.guild is None:
+        return
+    log_channel = await _get_message_log_channel(message.guild)
+    if log_channel is None or message.channel.id == log_channel.id:
+        return
+
+    embed = discord.Embed(
+        title="🗑️ Nachricht gelöscht",
+        color=discord.Colour.dark_red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Autor", value=f"{message.author} (`{message.author.id}`)" if message.author else "Unbekannt", inline=True)
+    embed.add_field(name="Kanal", value=message.channel.mention, inline=True)
+    embed.add_field(name="Inhalt", value=_truncate(message.content), inline=False)
+    if message.attachments:
+        embed.add_field(
+            name="Anhänge",
+            value="\n".join(a.filename for a in message.attachments)[:1000],
+            inline=False,
+        )
+    embed.set_footer(text=f"Nachrichten-ID: {message.id}")
+
+    try:
+        await log_channel.send(embed=embed)
+    except discord.HTTPException as e:
+        log.warning("Konnte Delete-Log nicht senden: %s", e)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if before.guild is None or before.content == after.content:
+        return  # Embeds/Link-Previews lösen ebenfalls edit aus, ohne echten Textwechsel
+    log_channel = await _get_message_log_channel(before.guild)
+    if log_channel is None or before.channel.id == log_channel.id:
+        return
+
+    embed = discord.Embed(
+        title="✏️ Nachricht bearbeitet",
+        color=discord.Colour.orange(),
+        timestamp=datetime.now(timezone.utc),
+        url=after.jump_url,
+    )
+    embed.add_field(name="Autor", value=f"{before.author} (`{before.author.id}`)", inline=True)
+    embed.add_field(name="Kanal", value=before.channel.mention, inline=True)
+    embed.add_field(name="Vorher", value=_truncate(before.content), inline=False)
+    embed.add_field(name="Nachher", value=_truncate(after.content), inline=False)
+    embed.set_footer(text=f"Nachrichten-ID: {before.id}")
+
+    try:
+        await log_channel.send(embed=embed)
+    except discord.HTTPException as e:
+        log.warning("Konnte Edit-Log nicht senden: %s", e)
 
 
 if __name__ == "__main__":

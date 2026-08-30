@@ -207,7 +207,10 @@ async def build_server_structure(guild: discord.Guild) -> discord.TextChannel:
         existing = discord.utils.get(guild.text_channels, name=name)
         if existing:
             return existing
-        return await guild.create_text_channel(name, category=category, overwrites=overwrites)
+        kwargs = {"category": category}
+        if overwrites is not None:
+            kwargs["overwrites"] = overwrites
+        return await guild.create_text_channel(name, **kwargs)
 
     ankuendigungen = await ensure_channel("📢-ankuendigungen", info_cat)
     info_channel = await ensure_channel("ℹ️-info", info_cat)

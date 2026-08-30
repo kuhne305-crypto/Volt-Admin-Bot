@@ -194,7 +194,11 @@ class Moderation(commands.Cog):
             msg = "❌ Dir fehlt die nötige Berechtigung für diesen Befehl."
         else:
             log.exception("Fehler in Moderation-Command", exc_info=error)
-            msg = "❌ Es ist ein Fehler aufgetreten."
+            # das eigentliche Original (z.B. FileNotFoundError, Forbidden, ...)
+            # steckt bei App-Command-Fehlern meist in error.original
+            original = getattr(error, "original", error)
+            short_error = f"{type(original).__name__}: {original}"[:1500]
+            msg = f"❌ Es ist ein Fehler aufgetreten:\n```\n{short_error}\n```"
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
         else:

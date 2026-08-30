@@ -31,9 +31,11 @@ async def log_action(guild: discord.Guild, embed: discord.Embed):
     channel = await get_log_channel(guild)
     if channel:
         embed.set_footer(text=branding.ADMIN_FOOTER)
-        embed.set_thumbnail(url=f"attachment://{os.path.basename(branding.ICON)}")
+        file = branding.banner_file(branding.ICON)
+        if file:
+            embed.set_thumbnail(url=f"attachment://{os.path.basename(branding.ICON)}")
         try:
-            await channel.send(embed=embed, file=branding.banner_file(branding.ICON))
+            await channel.send(embed=embed, file=file)
         except discord.Forbidden:
             pass
 
@@ -179,6 +181,9 @@ class Moderation(commands.Cog):
     @app_commands.command(name="setup-verify", description="[Admin] Postet den Verify-Button in diesen Kanal")
     @app_commands.checks.has_permissions(administrator=True)
     async def setup_verify(self, interaction: discord.Interaction, verified_rolle: str = "Verified"):
+        # Zuerst deferren, dann erst die (potenziell langsame) Datei senden -
+        # sonst kann die Interaction ablaufen ("Es ist ein Fehler aufgetreten").
+        await interaction.response.defer(ephemeral=True, thinking=True)
         embed = discord.Embed(
             title="✅ Verifizierung",
             description="Klicke auf den Button, um dich zu verifizieren und Zugriff auf den Server zu erhalten.",
@@ -186,7 +191,7 @@ class Moderation(commands.Cog):
         )
         embed, file = branding.with_icon_thumbnail(embed)
         await interaction.channel.send(embed=embed, file=file, view=VerifyView(verified_rolle))
-        await interaction.response.send_message("✅ Verify-Panel gepostet.", ephemeral=True)
+        await interaction.followup.send("✅ Verify-Panel gepostet.", ephemeral=True)
 
     # -------------------------------------------------------- error handler
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):

@@ -10,8 +10,12 @@ import os
 import discord
 
 VOLT_RED = discord.Color.from_rgb(224, 17, 17)   # Rot aus den Bannern
-VOLT_BLACK = discord.Color.from_rgb(10, 10, 10)
-
+# unter VOLT_BLACK einfügen
+VOLT_BLUE = discord.Color.from_rgb(52, 152, 219)     # Infos
+VOLT_GREEN = discord.Color.from_rgb(46, 204, 113)    # Willkommen
+VOLT_GOLD = discord.Color.from_rgb(241, 196, 15)     # Shop
+VOLT_PURPLE = discord.Color.from_rgb(155, 89, 182)   # Tickets
+VOLT_GREY = discord.Color.from_rgb(149, 165, 166)    # Team-intern
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
 
 ICON = os.path.join(ASSETS_DIR, "volt_icon.png")

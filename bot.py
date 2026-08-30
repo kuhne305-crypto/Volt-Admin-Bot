@@ -120,11 +120,12 @@ async def on_member_remove(member):
 #  RESET (alles löschen)
 # ============================================================
 
-async def wipe_guild(guild: discord.Guild):
-    """Löscht alle Kanäle/Kategorien und alle nicht-verwalteten Rollen
-    unterhalb der Bot-Rolle. @everyone, Bot-Rollen & Integrations-Rollen
-    (z.B. von Boost-Level, verlinkten Bots) bleiben unangetastet."""
+async def wipe_guild(guild: discord.Guild, skip_channel_id: int | None = None):
+    """Löscht alle Kanäle/Kategorien (außer skip_channel_id) und alle
+    nicht-verwalteten Rollen unterhalb der Bot-Rolle."""
     for channel in list(guild.channels):
+        if skip_channel_id and channel.id == skip_channel_id:
+            continue
         try:
             await channel.delete(reason="VOLT Setup: Reset")
         except (discord.Forbidden, discord.HTTPException):
@@ -135,7 +136,7 @@ async def wipe_guild(guild: discord.Guild):
         if role.is_default() or role.managed:
             continue
         if role >= me.top_role:
-            continue  # kann Bot eh nicht löschen
+            continue
         try:
             await role.delete(reason="VOLT Setup: Reset")
         except (discord.Forbidden, discord.HTTPException):
@@ -283,6 +284,7 @@ async def build_server_structure(guild: discord.Guild) -> discord.TextChannel:
 @is_admin()
 async def setup_cmd(interaction: discord.Interaction):
     guild = interaction.guild
+    origin_channel_id = interaction.channel_id
 
     warn_embed = discord.Embed(
         title="⚠️ Server-Reset",
@@ -302,25 +304,33 @@ async def setup_cmd(interaction: discord.Interaction):
         return
 
     status = await interaction.followup.send("🧨 Lösche alte Struktur...", ephemeral=True)
-    await wipe_guild(guild)
-    await status.edit(content="🏗️ Baue neue Struktur auf...")
-    log_channel = await build_server_structure(guild)
-    await status.edit(content=f"✅ Server-Reset abgeschlossen! Details in {log_channel.mention}.")
 
+    try:
+        # eigenen Kanal beim Wipe aussparen, sonst bricht die Interaction ab
+        await wipe_guild(guild, skip_channel_id=origin_channel_id)
+        await status.edit(content="🏗️ Baue neue Struktur auf...")
+        log_channel = await build_server_structure(guild)
+        await status.edit(content=f"✅ Server-Reset abgeschlossen! Details in {log_channel.mention}.")
 
-@bot.tree.command(name="security-status", description="[Admin] Zeigt die aktuellen Anti-Nuke-Einstellungen")
-@is_admin()
-async def security_status(interaction: discord.Interaction):
-    embed = discord.Embed(title="🛡️ VOLT Anti-Nuke Status", color=VOLT_RED)
-    embed.add_field(name="Schwellwert", value=f"{ANTINUKE_THRESHOLD} Aktionen", inline=True)
-    embed.add_field(name="Zeitfenster", value=f"{ANTINUKE_WINDOW} Sekunden", inline=True)
-    embed.add_field(
-        name="Whitelist (nie gesperrt)",
-        value=", ".join(f"<@{uid}>" for uid in OWNER_IDS) or "— keine gesetzt —",
-        inline=False,
-    )
-    embed, file = branding.with_icon_thumbnail(embed)
-    await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+        # alten Ursprungskanal jetzt sicher nachträglich löschen (falls er nicht
+        # zufällig selbst zum neuen admin-logs-Kanal geworden ist)
+        origin_channel = guild.get_channel(origin_channel_id)
+        if origin_channel and origin_channel.id != log_channel.id:
+            try:
+                await origin_channel.delete(reason="VOLT Setup: Reset (alter Ursprungskanal)")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    except Exception:
+        log.exception("Fehler beim Server-Reset")
+        try:
+            await status.edit(content="❌ Beim Neuaufbau ist ein Fehler aufgetreten, siehe Bot-Logs.")
+        except discord.HTTPException:
+            # Ursprungskanal existiert nicht mehr -> per DM Bescheid geben
+            try:
+                await interaction.user.send("❌ Beim Server-Reset ist ein Fehler aufgetreten, siehe Bot-Logs.")
+            except discord.Forbidden:
+                pass
 
 
 @setup_cmd.error

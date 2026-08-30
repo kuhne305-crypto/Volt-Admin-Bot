@@ -21,6 +21,7 @@ Einrichtung:
 
 import os
 import logging
+import traceback
 
 import discord
 from discord import app_commands
@@ -321,16 +322,37 @@ async def setup_cmd(interaction: discord.Interaction):
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
-    except Exception:
+    except Exception as e:
+        # Vollen Traceback in die Konsole/Logs schreiben - so siehst du
+        # beim nächsten Fehler SOFORT, woran es lag, statt "nichts passiert".
         log.exception("Fehler beim Server-Reset")
+        short_error = f"{type(e).__name__}: {e}"[:1500]
+
         try:
-            await status.edit(content="❌ Beim Neuaufbau ist ein Fehler aufgetreten, siehe Bot-Logs.")
+            await status.edit(content=f"❌ Beim Neuaufbau ist ein Fehler aufgetreten:\n```\n{short_error}\n```")
         except discord.HTTPException:
-            # Ursprungskanal existiert nicht mehr -> per DM Bescheid geben
+            # Ursprungskanal/Interaction nicht mehr erreichbar -> per DM Bescheid geben
             try:
-                await interaction.user.send("❌ Beim Server-Reset ist ein Fehler aufgetreten, siehe Bot-Logs.")
+                await interaction.user.send(
+                    f"❌ Beim Server-Reset ist ein Fehler aufgetreten:\n```\n{short_error}\n```"
+                )
             except discord.Forbidden:
                 pass
+
+
+@bot.tree.command(name="security-status", description="[Admin] Zeigt die aktuellen Anti-Nuke-Einstellungen")
+@is_admin()
+async def security_status(interaction: discord.Interaction):
+    embed = discord.Embed(title="🛡️ VOLT Anti-Nuke Status", color=VOLT_RED)
+    embed.add_field(name="Schwellwert", value=f"{ANTINUKE_THRESHOLD} Aktionen", inline=True)
+    embed.add_field(name="Zeitfenster", value=f"{ANTINUKE_WINDOW} Sekunden", inline=True)
+    embed.add_field(
+        name="Whitelist (nie gesperrt)",
+        value=", ".join(f"<@{uid}>" for uid in OWNER_IDS) or "— keine gesetzt —",
+        inline=False,
+    )
+    embed, file = branding.with_icon_thumbnail(embed)
+    await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
 
 
 @setup_cmd.error

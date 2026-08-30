@@ -367,10 +367,13 @@ async def on_admin_command_error(interaction: discord.Interaction, error):
         )
     else:
         log.exception("Fehler in Admin-Command", exc_info=error)
+        original = getattr(error, "original", error)
+        short_error = f"{type(original).__name__}: {original}"[:1500]
+        msg = f"❌ Es ist ein Fehler aufgetreten:\n```\n{short_error}\n```"
         if interaction.response.is_done():
-            await interaction.followup.send("❌ Es ist ein Fehler aufgetreten.", ephemeral=True)
+            await interaction.followup.send(msg, ephemeral=True)
         else:
-            await interaction.response.send_message("❌ Es ist ein Fehler aufgetreten.", ephemeral=True)
+            await interaction.response.send_message(msg, ephemeral=True)
 
 
 if __name__ == "__main__":
